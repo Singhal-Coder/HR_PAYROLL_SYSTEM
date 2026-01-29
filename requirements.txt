@@ -1,0 +1,8 @@
+opencv-python<4.9
+face_recognition
+numpy<2
+python-dotenv
+reportlab
+tkcalendar
+Pillow
+bcrypt
