@@ -2,13 +2,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from tkcalendar import DateEntry
 import cv2
-import face_recognition
-import numpy as np
 from PIL import Image, ImageTk
 import logging
 
 from ui.styles import *
 from models.employee_model import EmployeeModel
+from services.face_service import detect_head_pose, get_face_landmarks, get_face_encodings
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +197,7 @@ class EmployeeFrame(tk.Frame):
         rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
         
         # Detect Landmarks
-        landmarks_list = face_recognition.face_landmarks(rgb_small)
+        landmarks_list = get_face_landmarks(rgb_small)
         
         if not landmarks_list:
             self.update_instruction("No Face Detected", "#e74c3c")
@@ -207,7 +206,7 @@ class EmployeeFrame(tk.Frame):
         # Assuming single face
         landmarks = landmarks_list[0]
         
-        pose = self._detect_pose(landmarks)
+        pose = detect_head_pose(landmarks)
 
         # Capture Logic
         if pose == target_pose:
@@ -227,8 +226,9 @@ class EmployeeFrame(tk.Frame):
 
     def _capture_snap(self, rgb_frame):
         """Encodings generate karta hai aur state change karta hai"""
-        encodings = face_recognition.face_encodings(rgb_frame)
-        if not encodings: return
+        encodings = get_face_encodings(rgb_frame)
+        if not encodings:
+            return
         
         self.captured_encodings.append(encodings[0])
         count = len(self.captured_encodings)
@@ -243,32 +243,6 @@ class EmployeeFrame(tk.Frame):
             self.capture_state = 'RIGHT' # Next
         elif count == 5:
             self.capture_state = 'DONE' # Finished
-
-    def _detect_pose(self, landmarks):
-        """
-        Uses facial landmarks to estimate head pose.
-        Returns: 'FRONT', 'LEFT', 'RIGHT'
-        """
-        # Points (face_recognition uses dictionary)
-        left_eye = np.mean(landmarks['left_eye'], axis=0)
-        right_eye = np.mean(landmarks['right_eye'], axis=0)
-        nose_tip = np.mean(landmarks['nose_tip'], axis=0)
-        
-        # Distances (Horizontal only)
-        # Note: Image is mirrored/flipped, so Left Eye on screen is actually Right Eye of person
-        # But for logic, we use Screen coordinates.
-        dist_left_screen = nose_tip[0] - left_eye[0]
-        dist_right_screen = right_eye[0] - nose_tip[0]
-        
-        ratio = dist_left_screen / (dist_right_screen + 1e-6)
-        
-        # Thresholds (Tuned for casual webcam)
-        if 0.6 < ratio < 1.4:
-            return 'FRONT'
-        elif ratio <= 0.6:
-            return 'LEFT' # Nose closer to Left Eye (Screen) -> User looking Left
-        else:
-            return 'RIGHT'
 
     def update_instruction(self, text, color):
         self.lbl_instruction.config(text=text, bg=color)
