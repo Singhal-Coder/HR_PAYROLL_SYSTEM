@@ -3,6 +3,9 @@ from tkinter import messagebox
 import cv2
 from PIL import Image, ImageTk
 import logging
+import time
+import threading
+from datetime import datetime
 
 from ui.styles import *
 from models.attendance_model import AttendanceModel
@@ -10,7 +13,6 @@ from services.face_service import process_face_recognition
 from services.attendance_service import mark_attendance as attendance_mark
 
 logger = logging.getLogger(__name__)
-
 
 class AttendanceFrame(tk.Frame):
     def __init__(self, parent, controller):
@@ -21,206 +23,266 @@ class AttendanceFrame(tk.Frame):
         # --- System State ---
         self.cap = None
         self.is_running = False
-        self.process_this_frame = True
+        
+        # UI State
         self.unknown_counter = 0
+        self.last_results = [] # Stores latest face boxes [(top, right, bottom, left), name, color]
+        
+        # Threading State
+        self.thread_lock = threading.Lock()
+        self.current_frame_to_process = None
+        self.is_processing = False
+        self.stop_event = threading.Event()
+
+        # Debouncing
+        self.last_shown_at = {} 
+        self.COOLDOWN_SECONDS = 5.0
 
         # RAM Cache
         self.known_face_encodings = []
         self.known_face_ids = []
         self.marked_today = set()
 
-        # UI Layout
         self._init_ui()
-        logger.info("Attendance UI Initialized")
+        logger.info("Attendance UI Initialized (Threaded)")
 
         self.after(100, self.start_system)
 
     def _init_ui(self):
-        # Header
-        header = tk.Frame(self, bg=SIDEBAR_BG, height=60)
-        header.pack(fill="x")
-        tk.Label(header, text="  Live Attendance System", font=FONT_HEADER, bg=SIDEBAR_BG, fg="white").pack(side="left", pady=10)
+        # 1. Main Container
+        self.grid_columnconfigure(0, weight=3) 
+        self.grid_columnconfigure(1, weight=1) 
+        self.grid_rowconfigure(0, weight=1)
 
-        # Main Content (Video Feed)
-        self.video_frame = tk.Frame(self, bg="black", bd=2, relief="sunken")
-        self.video_frame.pack(expand=True, fill="both", padx=20, pady=20)
+        # Left: Camera
+        self.left_panel = tk.Frame(self, bg="black", padx=10, pady=10)
+        self.left_panel.grid(row=0, column=0, sticky="nsew")
+        
+        tk.Label(self.left_panel, text="Live Camera Feed", font=("Segoe UI", 12), bg="black", fg="#bdc3c7").pack(anchor="nw")
+        
+        self.canvas = tk.Canvas(self.left_panel, bg="#1a1a1a", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
 
-        # Canvas
-        self.canvas = tk.Canvas(self.video_frame, bg="black", width=640, height=480)
-        self.canvas.pack()
+        self.status_frame = tk.Frame(self.left_panel, bg="black")
+        self.status_frame.pack(fill="x", pady=10)
+        self.lbl_status = tk.Label(self.status_frame, text="System Ready", font=("Segoe UI", 14), bg="black", fg="white")
+        self.lbl_status.pack(side="left")
 
-        # Status Bar
-        self.lbl_status = tk.Label(self, text="System Ready", font=("Segoe UI", 16), bg=BACKGROUND_MAIN, fg=TEXT_DARK)
-        self.lbl_status.pack(pady=10)
+        self.btn_manual = tk.Button(self.status_frame, text="Problems? Manual Check-In", 
+                                  command=self.open_manual_checkin,
+                                  bg="#e74c3c", fg="white", font=("Segoe UI", 10, "bold"), 
+                                  bd=0, padx=15, pady=5)
+        self.btn_manual.pack_forget()
 
-        # Manual Check-in Button
-        self.btn_manual = tk.Button(self, text="Manual Check-In", command=self.open_manual_checkin,
-                                    bg="#e74c3c", fg="white", font=FONT_BOLD, state="disabled")
+        # Right: Activity Feed
+        self.right_panel = tk.Frame(self, bg="white", bd=1, relief="solid")
+        self.right_panel.grid(row=0, column=1, sticky="nsew")
+        self.right_panel.pack_propagate(False)
+
+        feed_header = tk.Frame(self.right_panel, bg=SIDEBAR_BG, height=50)
+        feed_header.pack(fill="x")
+        tk.Label(feed_header, text="Recent Activity", font=("Segoe UI", 14, "bold"), bg=SIDEBAR_BG, fg="white").pack(pady=10)
+
+        self.feed_container = tk.Frame(self.right_panel, bg="#f4f6f9")
+        self.feed_container.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def open_manual_checkin(self):
+        top = tk.Toplevel(self)
+        top.title("Manual Check-In")
+        top.geometry("300x250")
+        top.configure(bg="white")
+        
+        tk.Label(top, text="Manual Entry", font=("Segoe UI", 12, "bold"), bg="white").pack(pady=10)
+        tk.Label(top, text="Enter Employee Code:", bg="white").pack()
+        
+        e_code = tk.Entry(top, font=("Segoe UI", 12), bd=2, relief="solid")
+        e_code.pack(pady=5, padx=20, fill="x")
+        
+        def submit():
+            code = e_code.get().strip()
+            if code:
+                success, msg = attendance_mark(code, method="MANUAL")
+                if success:
+                    self.marked_today.add(code)
+                    messagebox.showinfo("Success", msg)
+                    top.destroy()
+                else:
+                    messagebox.showerror("Failed", msg)
+        
+        tk.Button(top, text="Verify & Mark", command=submit, 
+                  bg=ACCENT_COLOR, fg="white", font=("Segoe UI", 11)).pack(pady=15)
 
     def start_system(self):
-        if self.is_running:
-            self.stop_system()
+        if self.is_running: return
 
-        logger.info("Starting Attendance System...")
-
-        self.lbl_status.config(text="Loading Biometric Data...", fg="#e67e22")
+        self.lbl_status.config(text="Loading Data...", fg="#f39c12")
         self.update_idletasks()
 
         try:
             self.known_face_encodings, self.known_face_ids = self.model.get_all_encodings()
             self.marked_today = self.model.get_todays_attendance()
-            logger.info(f"Loaded {len(self.known_face_encodings)} faces from DB.")
         except Exception as e:
-            logger.error(f"Data Load Error: {e}")
-            messagebox.showerror("Error", "Failed to load database")
+            logger.error(f"DB Error: {e}")
             return
 
         try:
             self.cap = cv2.VideoCapture(0)
-
-            if not self.cap.isOpened():
-                logger.critical("Camera failed to open! trying Index 1...")
-                self.cap = cv2.VideoCapture(1)
-                if not self.cap.isOpened():
-                    raise Exception("Could not open video device (Index 0 or 1)")
+            if not self.cap.isOpened(): self.cap = cv2.VideoCapture(1)
+            if not self.cap.isOpened(): raise Exception("No Camera Found")
 
             self.is_running = True
-            self.process_this_frame = True
+            self.stop_event.clear()
+            
+            # Start Background Thread for Recognition
+            self.process_thread = threading.Thread(target=self.recognition_worker, daemon=True)
+            self.process_thread.start()
 
-            self.update_frame()
-            self.lbl_status.config(text="Scanning...", fg=ACCENT_COLOR)
-            logger.info("Camera Started Successfully.")
+            self.update_frame_loop() # Start UI Loop
+            self.lbl_status.config(text="Scanning Active", fg=SUCCESS_COLOR)
 
         except Exception as e:
-            logger.error(f"Camera Start Error: {e}")
+            logger.error(f"Start Error: {e}")
             self.lbl_status.config(text="Camera Error", fg=ERROR_COLOR)
-            messagebox.showerror("Camera Error", f"Cannot access webcam.\nDetails: {e}")
+
+    def recognition_worker(self):
+        """Background Thread: Sirf Recognition karega"""
+        while not self.stop_event.is_set():
+            frame_copy = None
+            
+            with self.thread_lock:
+                if self.current_frame_to_process is not None:
+                    frame_copy = self.current_frame_to_process.copy()
+                    self.current_frame_to_process = None # Clear buffer
+            
+            if frame_copy is None:
+                time.sleep(0.05)
+                continue
+
+            try:
+                # 2. Heavy Processing
+                small_frame = cv2.resize(frame_copy, (0, 0), fx=0.25, fy=0.25)
+                rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+                results = process_face_recognition(
+                    rgb_small, self.known_face_encodings, self.known_face_ids
+                )
+
+                # 3. Process Results
+                processed_results = []
+                found_unknown = False
+                
+                for (top, right, bottom, left), emp_code in results:
+                    # Scale coordinates back
+                    coords = (top*4, right*4, bottom*4, left*4)
+                    
+                    if emp_code is None:
+                        processed_results.append((coords, "Unknown", ERROR_COLOR))
+                        found_unknown = True
+                    else:
+                        color = ACCENT_COLOR if emp_code in self.marked_today else SUCCESS_COLOR
+                        processed_results.append((coords, emp_code, color))
+                        
+                        # Trigger UI update in Main Thread
+                        self.after(0, lambda code=emp_code: self.handle_recognition(code))
+
+
+                if found_unknown:
+                    self.unknown_counter += 1
+                else:
+                    self.unknown_counter = 0
+
+                # 4. Update Shared State for Drawing
+                self.last_results = processed_results
+
+            except Exception as e:
+                logger.error(f"Worker Error: {e}")
+
+    def update_frame_loop(self):
+        """Main Thread: Sirf Video dikhayega"""
+        if not self.is_running: return
+
+        ret, frame = self.cap.read()
+        if ret:
+            frame = cv2.flip(frame, 1)
+            
+            # Pass frame to worker thread (if free)
+            with self.thread_lock:
+                self.current_frame_to_process = frame
+
+            # Draw Boxes (From last known results)
+            for (top, right, bottom, left), name, color in self.last_results:
+                c = tuple(int(color.lstrip("#")[i:i+2], 16) for i in (4, 2, 0))
+                cv2.rectangle(frame, (left, top), (right, bottom), c, 2)
+
+            if self.unknown_counter > 10:
+                self.btn_manual.pack(side="right", padx=10)
+            else:
+                self.btn_manual.pack_forget()
+
+            # Render
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Resize logic
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+            if cw > 10 and ch > 10:
+                img_pil = Image.fromarray(rgb_frame)
+                
+                # Aspect Ratio Resize
+                w, h = img_pil.size
+                scale = min(cw/w, ch/h)
+                new_w, new_h = int(w*scale), int(h*scale)
+                img_pil = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                
+                imgtk = ImageTk.PhotoImage(image=img_pil)
+                self.canvas.create_image(cw//2, ch//2, anchor="center", image=imgtk)
+                self.canvas.imgtk = imgtk
+
+        self.after(30, self.update_frame_loop) # Keep running smoothly
+
+    def handle_recognition(self, emp_code):
+        """UI updates (Called via self.after from worker)"""
+        last_time = self.last_shown_at.get(emp_code, 0)
+        if time.time() - last_time < self.COOLDOWN_SECONDS:
+            return
+
+        current_time_str = datetime.now().strftime("%H:%M:%S")
+        
+        if emp_code in self.marked_today:
+            self.create_activity_card(f"Employee {emp_code}", current_time_str, "Already Marked", False)
+        else:
+            success, msg = attendance_mark(emp_code)
+            if success:
+                clean_name = msg.replace("Welcome, ", "")
+                self.marked_today.add(emp_code)
+                self.create_activity_card(clean_name, current_time_str, "Marked Present", True)
+            
+        self.last_shown_at[emp_code] = time.time()
+
+    def create_activity_card(self, name, time_str, status, is_success):
+        border_color = SUCCESS_COLOR if is_success else ACCENT_COLOR
+        
+        card = tk.Frame(self.feed_container, bg="white", bd=0, highlightbackground=border_color, highlightthickness=2)
+        card.pack(side="top", fill="x", pady=5, padx=2)
+        
+        inner = tk.Frame(card, bg="white", padx=10, pady=10)
+        inner.pack(fill="both")
+        
+        tk.Label(inner, text=name, font=("Segoe UI", 12, "bold"), bg="white", fg=TEXT_DARK).pack(anchor="w")
+        
+        row = tk.Frame(inner, bg="white")
+        row.pack(fill="x", pady=(5,0))
+        tk.Label(row, text=time_str, font=("Segoe UI", 10), bg="white", fg="#7f8c8d").pack(side="left")
+        tk.Label(row, text=status, font=("Segoe UI", 10, "bold"), bg="white", fg=border_color).pack(side="right")
+        
+        if len(self.feed_container.winfo_children()) > 6:
+            self.feed_container.winfo_children()[0].destroy()
 
     def stop_system(self):
         self.is_running = False
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-        self.canvas.delete("all")
-        self.btn_manual.pack_forget()
-
-    def update_frame(self):
-        if not self.is_running or not self.cap:
-            return
-
-        try:
-            ret, frame = self.cap.read()
-            if not ret:
-                self.after(10, self.update_frame)
-                return
-
-            frame = cv2.flip(frame, 1)
-
-            small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-            rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-
-            face_locations = []
-            face_names = []
-            face_colors = []
-
-            if self.process_this_frame:
-                results = process_face_recognition(
-                    rgb_small_frame,
-                    self.known_face_encodings,
-                    self.known_face_ids,
-                    scale=1.0,
-                    tolerance=0.5,
-                )
-
-                for (top, right, bottom, left), emp_code in results:
-                    face_locations.append((top, right, bottom, left))
-                    name = "Unknown"
-                    color = "#e74c3c"
-
-                    if emp_code is None:
-                        self.unknown_counter += 1
-                    elif emp_code in self.marked_today:
-                        name = emp_code
-                        color = "#3498db"
-                        self.unknown_counter = 0
-                    else:
-                        success, msg = attendance_mark(emp_code)
-                        if success:
-                            self.marked_today.add(emp_code)
-                            name = msg
-                            color = "#2ecc71"
-                            self.unknown_counter = 0
-                        else:
-                            name = msg
-                            color = "#e74c3c"
-                            self.unknown_counter = 0
-
-                    face_names.append(name)
-                    face_colors.append(color)
-
-                if not results:
-                    self.unknown_counter = 0
-
-            self.process_this_frame = not self.process_this_frame
-
-            # Drawing (scale 4: small frame was 0.25)
-            for (top, right, bottom, left), name, color in zip(face_locations, face_names, face_colors):
-                top *= 4
-                right *= 4
-                bottom *= 4
-                left *= 4
-
-                cv_color = tuple(int(color.lstrip("#")[i:i+2], 16) for i in (4, 2, 0))
-                cv2.rectangle(frame, (left, top), (right, bottom), cv_color, 2)
-                cv2.rectangle(frame, (left, bottom - 35), (right, bottom), cv_color, cv2.FILLED)
-                cv2.putText(frame, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-            if self.unknown_counter > 30:
-                self.btn_manual.pack(pady=5)
-                self.lbl_status.config(text="Not Recognized? Use Manual Check-in", fg=ERROR_COLOR)
-            else:
-                self.btn_manual.pack_forget()
-                if not face_locations:
-                    self.lbl_status.config(text="Scanning...", fg=TEXT_DARK)
-
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(rgb_frame)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.canvas.create_image(0, 0, anchor="nw", image=imgtk)
-            self.canvas.imgtk = imgtk
-
-            self.after(30, self.update_frame)
-
-        except Exception as e:
-            logger.error(f"Update Loop Crashed: {e}")
-            self.stop_system()
-
-    def open_manual_checkin(self):
-        top = tk.Toplevel(self)
-        top.title("Manual Check-In")
-        top.geometry("300x200")
-        top.configure(bg="white")
-
-        tk.Label(top, text="Enter Employee Code", bg="white", font=FONT_NORMAL).pack(pady=10)
-        e_code = tk.Entry(top, font=FONT_NORMAL, bd=2)
-        e_code.pack(pady=5)
-
-        def submit():
-            code = e_code.get().strip()
-            if not code:
-                return
-
-            success, msg = attendance_mark(code, method="MANUAL")
-            if success:
-                messagebox.showinfo("Success", msg)
-                self.marked_today.add(code)
-                top.destroy()
-            else:
-                messagebox.showerror("Failed", msg)
-
-        tk.Button(top, text="Mark Present", command=submit, bg=ACCENT_COLOR, fg="white").pack(pady=20)
+        self.stop_event.set() # Stop worker
+        if self.cap: self.cap.release()
 
     def destroy(self):
-        logger.info("Cleaning up Attendance Frame...")
         self.stop_system()
         super().destroy()

@@ -6,6 +6,7 @@ import logging
 from datetime import datetime
 
 from models.attendance_model import AttendanceModel
+from utils.network import is_connected_to_office_network
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,12 @@ def mark_attendance(emp_code: str, method: str = "FACE") -> tuple[bool, str]:
     """
     Load shift info, compute status, insert via model. Returns (success, message).
     """
+
+
+    if method == "MANUAL":
+        if not is_connected_to_office_network():
+            return (False, "Security Alert: Not connected to Office Wi-Fi.")
+
     model = AttendanceModel()
     full_name, shift_start_str = model.get_employee_shift_info(emp_code)
 

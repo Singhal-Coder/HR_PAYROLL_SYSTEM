@@ -1,9 +1,12 @@
 import tkinter as tk
+from datetime import datetime
+
+from models.dashboard_model import DashboardModel
 from ui.styles import *
-# Abhi ke liye hum dummy frames import karenge, baad mein actual files banayenge
+
 from ui.employee_ui import EmployeeFrame 
 from ui.attendance_ui import AttendanceFrame
-# from ui.payroll_ui import PayrollFrame (Future)
+from ui.payroll_ui import PayrollFrame
 
 class DashboardFrame(tk.Frame):
     def __init__(self, parent, controller):
@@ -70,13 +73,13 @@ class DashboardFrame(tk.Frame):
         self.switch_content(AttendanceFrame)
         
     def show_payroll(self):
-        # self.switch_content(PayrollFrame)
-        pass
+        self.switch_content(PayrollFrame)
 
-# --- Dummy Views for Testing ---
 class HomeView(tk.Frame):
     def __init__(self, parent, controller):
         super().__init__(parent, bg=BACKGROUND_MAIN)
+        self.model = DashboardModel()
+        
         tk.Label(self, text="Dashboard Overview", font=FONT_HEADER, 
                  bg=BACKGROUND_MAIN, fg=TEXT_DARK).pack(anchor="w")
         
@@ -84,9 +87,13 @@ class HomeView(tk.Frame):
         stats_frame = tk.Frame(self, bg=BACKGROUND_MAIN)
         stats_frame.pack(fill="x", pady=20)
         
-        self.create_card(stats_frame, "Total Employees", "Loading...", 0)
-        self.create_card(stats_frame, "Present Today", "0", 1)
-        self.create_card(stats_frame, "Pending Issues", "0", 2)
+        # Cards create karke Labels ko store kar rahe hain taaki update kar sakein
+        self.lbl_total = self.create_card(stats_frame, "Total Employees", "Loading...", 0)
+        self.lbl_present = self.create_card(stats_frame, "Present Today", "0", 1)
+        self.lbl_pending = self.create_card(stats_frame, "Pending Issues", "0", 2) # Placeholder logic
+
+        # Data Load Trigger
+        self.refresh_data()
 
     def create_card(self, parent, title, value, col):
         card = tk.Frame(parent, bg="white", padx=20, pady=20, relief="flat")
@@ -94,4 +101,15 @@ class HomeView(tk.Frame):
         parent.grid_columnconfigure(col, weight=1)
         
         tk.Label(card, text=title, font=FONT_NORMAL, bg="white", fg="#7f8c8d").pack(anchor="w")
-        tk.Label(card, text=value, font=("Segoe UI", 24, "bold"), bg="white", fg=ACCENT_COLOR).pack(anchor="w")
+        
+        # Value Label return kar rahe hain
+        lbl = tk.Label(card, text=value, font=("Segoe UI", 24, "bold"), bg="white", fg=ACCENT_COLOR)
+        lbl.pack(anchor="w")
+        return lbl
+
+    def refresh_data(self):
+        stats = self.model.get_dashboard_stats()
+        
+        self.lbl_total.config(text=str(stats['total_emp']))
+        self.lbl_present.config(text=str(stats['present_today']))
+        self.lbl_pending.config(text=str(stats['pending']))
